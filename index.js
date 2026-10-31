@@ -19,6 +19,7 @@ const {
   GUILD_ID,
   VERIFIED_ROLE_ID,
   FALLBACK_CHANNEL_ID,
+  DAYCARE_CHANNEL_ID,
   API_KEY,
   FIREBASE_DB_URL,
   FIREBASE_AUTH,
@@ -31,6 +32,9 @@ if (missing.length) {
   console.error('Missing env vars:', missing.join(', '));
   process.exit(1);
 }
+
+// Channel keys the game can ask the bot to post in (see /notify "channel")
+const CHANNELS = { daycare: DAYCARE_CHANNEL_ID };
 
 /* ------------------------------------------------------------------ */
 /* Storage: Firebase Realtime Database (REST), cached in memory        */
@@ -202,13 +206,35 @@ client.on('interactionCreate', async (interaction) => {
 
 client.once('ready', () => console.log(`Logged in as ${client.user.tag}`));
 
-/* Send a notification to a linked Discord user. Returns 'dm' | 'channel' | null */
-async function notifyDiscordUser(discordId, { title, message }) {
+/*
+ * Send a notification to a linked Discord user.
+ * - If channelId is given: post in that channel with an @mention (no DM).
+ * - Otherwise: DM the user, falling back to FALLBACK_CHANNEL_ID if DMs are closed.
+ * Returns 'dm' | 'channel' | null
+ */
+async function notifyDiscordUser(discordId, { title, message, channelId }) {
   const embed = new EmbedBuilder()
     .setColor(0xe2231a)
     .setDescription(String(message).slice(0, 1000))
     .setTimestamp();
   if (title) embed.setTitle(String(title).slice(0, 200));
+
+  // Post in a specific channel instead of DMing
+  if (channelId) {
+    try {
+      const channel = await client.channels.fetch(channelId);
+      await channel.send({
+        content: `<@${discordId}>`,
+        embeds: [embed],
+        // Only ever ping the target user, never @everyone / roles
+        allowedMentions: { users: [discordId] },
+      });
+      return 'channel';
+    } catch (err) {
+      console.error('Channel send failed:', err.message);
+      return null;
+    }
+  }
 
   try {
     const user = await client.users.fetch(discordId);
@@ -222,7 +248,6 @@ async function notifyDiscordUser(discordId, { title, message }) {
         await channel.send({
           content: `<@${discordId}>`,
           embeds: [embed],
-          // Only ever ping the target user, never @everyone / roles
           allowedMentions: { users: [discordId] },
         });
         return 'channel';
@@ -300,18 +325,25 @@ app.post('/verify', auth, async (req, res) => {
   res.json({ ok: true, robloxName: name });
 });
 
-/* Roblox game sends { userId, message, title? } to ping a player */
+/* Roblox game sends { userId, message, title?, channel? } to ping a player.
+   channel is a key from CHANNELS (e.g. "daycare"); omit it to DM the player. */
 app.post('/notify', auth, async (req, res) => {
   const userId = Number(req.body.userId);
-  const { message, title } = req.body;
+  const { message, title, channel } = req.body;
   if (!Number.isInteger(userId) || !message) {
     return res.status(400).json({ error: 'bad_request' });
+  }
+
+  let channelId;
+  if (channel) {
+    channelId = CHANNELS[channel];
+    if (!channelId) return res.status(400).json({ error: 'unknown_channel' });
   }
 
   const discordId = links[userId];
   if (!discordId) return res.status(404).json({ error: 'not_linked' });
 
-  const via = await notifyDiscordUser(discordId, { title, message });
+  const via = await notifyDiscordUser(discordId, { title, message, channelId });
   if (!via) return res.status(502).json({ error: 'could_not_deliver' });
   res.json({ ok: true, via });
 });
