@@ -12,7 +12,7 @@ const {
   EmbedBuilder,
   MessageFlags,
 } = require('discord.js');
- 
+
 const {
   DISCORD_TOKEN,
   CLIENT_ID,
@@ -20,33 +20,84 @@ const {
   VERIFIED_ROLE_ID,
   FALLBACK_CHANNEL_ID,
   API_KEY,
+  FIREBASE_DB_URL,
+  FIREBASE_AUTH,
   PORT = 3000,
 } = process.env;
- 
-if (!DISCORD_TOKEN || !CLIENT_ID || !API_KEY) {
-  console.error('Missing DISCORD_TOKEN, CLIENT_ID or API_KEY in .env');
+
+if (!DISCORD_TOKEN || !CLIENT_ID || !API_KEY || !FIREBASE_DB_URL || !FIREBASE_AUTH) {
+  console.error('Missing DISCORD_TOKEN, CLIENT_ID, API_KEY, FIREBASE_DB_URL or FIREBASE_AUTH in env');
   process.exit(1);
 }
- 
+
 /* ------------------------------------------------------------------ */
-/* Storage (simple JSON file: { robloxId: discordId })                 */
+/* Storage: Firebase Realtime Database (REST), cached in memory        */
+/* Layout: DiscordLinks/<robloxId> = "<discordId>"                     */
 /* ------------------------------------------------------------------ */
-const DATA_FILE = path.join(__dirname, 'links.json');
-let links = {};
-try {
-  links = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-} catch {
-  links = {};
+const FB_ROOT = 'DiscordLinks';
+const OLD_DATA_FILE = path.join(__dirname, 'links.json'); // only used for one-time import
+
+let links = {}; // in-memory cache: { robloxId: discordId }
+
+function fbUrl(sub) {
+  const base = FIREBASE_DB_URL.replace(/\/+$/, '');
+  const node = sub ? `${FB_ROOT}/${encodeURIComponent(sub)}` : FB_ROOT;
+  return `${base}/${node}.json?auth=${encodeURIComponent(FIREBASE_AUTH)}`;
 }
-const save = () => fs.writeFileSync(DATA_FILE, JSON.stringify(links, null, 2));
- 
+
+async function fbRequest(method, sub, body) {
+  const res = await fetch(fbUrl(sub), {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body,
+  });
+  if (!res.ok) {
+    throw new Error(`Firebase ${method} failed: ${res.status} ${await res.text()}`);
+  }
+  return res.json();
+}
+
+// Discord IDs are stored as strings so they never lose precision
+const saveLink = (robloxId, discordId) =>
+  fbRequest('PUT', String(robloxId), JSON.stringify(String(discordId)));
+
+const deleteLink = (robloxId) => fbRequest('DELETE', String(robloxId));
+
+async function initStorage() {
+  const data = await fbRequest('GET');
+  links = {};
+  if (data) {
+    for (const [rid, did] of Object.entries(data)) {
+      if (did) links[rid] = String(did);
+    }
+  }
+
+  // One-time import: if an old links.json still exists, copy missing entries into Firebase
+  try {
+    const old = JSON.parse(fs.readFileSync(OLD_DATA_FILE, 'utf8'));
+    let imported = 0;
+    for (const [rid, did] of Object.entries(old)) {
+      if (!links[rid]) {
+        await saveLink(rid, did);
+        links[rid] = String(did);
+        imported++;
+      }
+    }
+    if (imported) console.log(`Imported ${imported} links from links.json.`);
+  } catch {
+    /* no old file, nothing to import */
+  }
+
+  console.log(`Loaded ${Object.keys(links).length} links from Firebase.`);
+}
+
 const robloxIdFor = (discordId) =>
   Object.keys(links).find((rid) => links[rid] === discordId);
- 
+
 /* Pending link codes: code -> { discordId, expires } */
 const pending = new Map();
 const CODE_TTL_MS = 10 * 60 * 1000;
- 
+
 function makeCode(discordId) {
   // Remove any older code this user already had
   for (const [code, p] of pending) if (p.discordId === discordId) pending.delete(code);
@@ -54,17 +105,17 @@ function makeCode(discordId) {
   pending.set(code, { discordId, expires: Date.now() + CODE_TTL_MS });
   return code;
 }
- 
+
 setInterval(() => {
   const now = Date.now();
   for (const [code, p] of pending) if (p.expires < now) pending.delete(code);
 }, 60 * 1000);
- 
+
 /* ------------------------------------------------------------------ */
 /* Discord bot                                                         */
 /* ------------------------------------------------------------------ */
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
- 
+
 const commands = [
   new SlashCommandBuilder()
     .setName('link')
@@ -76,7 +127,7 @@ const commands = [
     .setName('status')
     .setDescription('See which Roblox account you have linked'),
 ].map((c) => c.toJSON());
- 
+
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
   const route = GUILD_ID
@@ -85,7 +136,7 @@ async function registerCommands() {
   await rest.put(route, { body: commands });
   console.log('Slash commands registered.');
 }
- 
+
 async function robloxName(userId) {
   try {
     const res = await fetch(`https://users.roblox.com/v1/users/${userId}`);
@@ -96,11 +147,11 @@ async function robloxName(userId) {
     return null;
   }
 }
- 
+
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   const flags = MessageFlags.Ephemeral;
- 
+
   if (interaction.commandName === 'link') {
     if (robloxIdFor(interaction.user.id)) {
       return interaction.reply({
@@ -122,18 +173,23 @@ client.on('interactionCreate', async (interaction) => {
       );
     return interaction.reply({ embeds: [embed], flags });
   }
- 
+
   if (interaction.commandName === 'unlink') {
     const rid = robloxIdFor(interaction.user.id);
     if (!rid) return interaction.reply({ content: "You don't have a linked account.", flags });
+    try {
+      await deleteLink(rid);
+    } catch (err) {
+      console.error('Failed to delete link:', err.message);
+      return interaction.reply({ content: 'Something went wrong unlinking. Try again in a moment.', flags });
+    }
     delete links[rid];
-    save();
     if (VERIFIED_ROLE_ID && interaction.inGuild()) {
       interaction.member.roles.remove(VERIFIED_ROLE_ID).catch(() => {});
     }
     return interaction.reply({ content: 'Your Roblox account has been unlinked.', flags });
   }
- 
+
   if (interaction.commandName === 'status') {
     const rid = robloxIdFor(interaction.user.id);
     if (!rid) return interaction.reply({ content: 'No Roblox account linked. Use `/link`.', flags });
@@ -141,9 +197,9 @@ client.on('interactionCreate', async (interaction) => {
     return interaction.reply({ content: `Linked to Roblox user **${name}** (ID \`${rid}\`).`, flags });
   }
 });
- 
+
 client.once('ready', () => console.log(`Logged in as ${client.user.tag}`));
- 
+
 /* Send a notification to a linked Discord user. Returns 'dm' | 'channel' | null */
 async function notifyDiscordUser(discordId, { title, message }) {
   const embed = new EmbedBuilder()
@@ -151,7 +207,7 @@ async function notifyDiscordUser(discordId, { title, message }) {
     .setDescription(String(message).slice(0, 1000))
     .setTimestamp();
   if (title) embed.setTitle(String(title).slice(0, 200));
- 
+
   try {
     const user = await client.users.fetch(discordId);
     await user.send({ embeds: [embed] });
@@ -175,13 +231,13 @@ async function notifyDiscordUser(discordId, { title, message }) {
     return null;
   }
 }
- 
+
 /* ------------------------------------------------------------------ */
 /* HTTP API (called from Roblox servers)                               */
 /* ------------------------------------------------------------------ */
 const app = express();
 app.use(express.json({ limit: '10kb' }));
- 
+
 function auth(req, res, next) {
   const given = Buffer.from(String(req.get('x-api-key') || ''));
   const expected = Buffer.from(API_KEY);
@@ -190,9 +246,9 @@ function auth(req, res, next) {
   }
   next();
 }
- 
+
 app.get('/health', (_req, res) => res.json({ ok: true }));
- 
+
 /* Roblox game sends { userId, code } when a player types /link CODE */
 app.post('/verify', auth, async (req, res) => {
   const userId = Number(req.body.userId);
@@ -200,22 +256,28 @@ app.post('/verify', auth, async (req, res) => {
   if (!Number.isInteger(userId) || userId <= 0 || !code) {
     return res.status(400).json({ error: 'bad_request' });
   }
- 
+
   const p = pending.get(code);
   if (!p || p.expires < Date.now()) {
     return res.status(404).json({ error: 'invalid_or_expired_code' });
   }
- 
+
   if (links[userId] && links[userId] !== p.discordId) {
     return res.status(409).json({ error: 'roblox_already_linked' });
   }
- 
+
+  // Save to Firebase first so a player is never told "linked" when it wasn't saved
+  try {
+    await saveLink(userId, p.discordId);
+  } catch (err) {
+    console.error('Failed to save link:', err.message);
+    return res.status(500).json({ error: 'storage_failed' });
+  }
   pending.delete(code);
   links[userId] = p.discordId;
-  save();
- 
+
   const name = (await robloxName(userId)) || `ID ${userId}`;
- 
+
   // Optional: give the verified role in every server the bot is in
   if (VERIFIED_ROLE_ID) {
     for (const guild of client.guilds.cache.values()) {
@@ -227,15 +289,15 @@ app.post('/verify', auth, async (req, res) => {
       }
     }
   }
- 
+
   notifyDiscordUser(p.discordId, {
     title: 'Account linked ✅',
     message: `Your Discord is now linked to Roblox user **${name}**. You'll get pings here for in-game events.`,
   });
- 
+
   res.json({ ok: true, robloxName: name });
 });
- 
+
 /* Roblox game sends { userId, message, title? } to ping a player */
 app.post('/notify', auth, async (req, res) => {
   const userId = Number(req.body.userId);
@@ -243,22 +305,23 @@ app.post('/notify', auth, async (req, res) => {
   if (!Number.isInteger(userId) || !message) {
     return res.status(400).json({ error: 'bad_request' });
   }
- 
+
   const discordId = links[userId];
   if (!discordId) return res.status(404).json({ error: 'not_linked' });
- 
+
   const via = await notifyDiscordUser(discordId, { title, message });
   if (!via) return res.status(502).json({ error: 'could_not_deliver' });
   res.json({ ok: true, via });
 });
- 
+
 /* Optional: check if a Roblox user is linked */
 app.get('/linked/:userId', auth, (req, res) => {
   res.json({ linked: Boolean(links[req.params.userId]) });
 });
- 
+
 /* ------------------------------------------------------------------ */
 (async () => {
+  await initStorage(); // load saved links before accepting anything
   await registerCommands();
   await client.login(DISCORD_TOKEN);
   app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
