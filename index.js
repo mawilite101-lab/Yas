@@ -25,8 +25,10 @@ const {
   PORT = 3000,
 } = process.env;
 
-if (!DISCORD_TOKEN || !CLIENT_ID || !API_KEY || !FIREBASE_DB_URL || !FIREBASE_AUTH) {
-  console.error('Missing DISCORD_TOKEN, CLIENT_ID, API_KEY, FIREBASE_DB_URL or FIREBASE_AUTH in env');
+const required = { DISCORD_TOKEN, CLIENT_ID, API_KEY, FIREBASE_DB_URL, FIREBASE_AUTH };
+const missing = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
+if (missing.length) {
+  console.error('Missing env vars:', missing.join(', '));
   process.exit(1);
 }
 
