@@ -19,83 +19,26 @@ const {
   GUILD_ID,
   VERIFIED_ROLE_ID,
   FALLBACK_CHANNEL_ID,
-  DAYCARE_CHANNEL_ID,
   API_KEY,
-  FIREBASE_DB_URL,
-  FIREBASE_AUTH,
   PORT = 3000,
 } = process.env;
 
-const required = { DISCORD_TOKEN, CLIENT_ID, API_KEY, FIREBASE_DB_URL, FIREBASE_AUTH };
-const missing = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
-if (missing.length) {
-  console.error('Missing env vars:', missing.join(', '));
+if (!DISCORD_TOKEN || !CLIENT_ID || !API_KEY) {
+  console.error('Missing DISCORD_TOKEN, CLIENT_ID or API_KEY in .env');
   process.exit(1);
 }
 
-// Channel keys the game can ask the bot to post in (see /notify "channel")
-const CHANNELS = { daycare: DAYCARE_CHANNEL_ID };
-
 /* ------------------------------------------------------------------ */
-/* Storage: Firebase Realtime Database (REST), cached in memory        */
-/* Layout: DiscordLinks/<robloxId> = "<discordId>"                     */
+/* Storage (simple JSON file: { robloxId: discordId })                 */
 /* ------------------------------------------------------------------ */
-const FB_ROOT = 'DiscordLinks';
-const OLD_DATA_FILE = path.join(__dirname, 'links.json'); // only used for one-time import
-
-let links = {}; // in-memory cache: { robloxId: discordId }
-
-function fbUrl(sub) {
-  const base = FIREBASE_DB_URL.replace(/\/+$/, '');
-  const node = sub ? `${FB_ROOT}/${encodeURIComponent(sub)}` : FB_ROOT;
-  return `${base}/${node}.json?auth=${encodeURIComponent(FIREBASE_AUTH)}`;
-}
-
-async function fbRequest(method, sub, body) {
-  const res = await fetch(fbUrl(sub), {
-    method,
-    headers: { 'Content-Type': 'application/json' },
-    body,
-  });
-  if (!res.ok) {
-    throw new Error(`Firebase ${method} failed: ${res.status} ${await res.text()}`);
-  }
-  return res.json();
-}
-
-// Discord IDs are stored as strings so they never lose precision
-const saveLink = (robloxId, discordId) =>
-  fbRequest('PUT', String(robloxId), JSON.stringify(String(discordId)));
-
-const deleteLink = (robloxId) => fbRequest('DELETE', String(robloxId));
-
-async function initStorage() {
-  const data = await fbRequest('GET');
+const DATA_FILE = path.join(__dirname, 'links.json');
+let links = {};
+try {
+  links = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+} catch {
   links = {};
-  if (data) {
-    for (const [rid, did] of Object.entries(data)) {
-      if (did) links[rid] = String(did);
-    }
-  }
-
-  // One-time import: if an old links.json still exists, copy missing entries into Firebase
-  try {
-    const old = JSON.parse(fs.readFileSync(OLD_DATA_FILE, 'utf8'));
-    let imported = 0;
-    for (const [rid, did] of Object.entries(old)) {
-      if (!links[rid]) {
-        await saveLink(rid, did);
-        links[rid] = String(did);
-        imported++;
-      }
-    }
-    if (imported) console.log(`Imported ${imported} links from links.json.`);
-  } catch {
-    /* no old file, nothing to import */
-  }
-
-  console.log(`Loaded ${Object.keys(links).length} links from Firebase.`);
 }
+const save = () => fs.writeFileSync(DATA_FILE, JSON.stringify(links, null, 2));
 
 const robloxIdFor = (discordId) =>
   Object.keys(links).find((rid) => links[rid] === discordId);
@@ -183,13 +126,8 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.commandName === 'unlink') {
     const rid = robloxIdFor(interaction.user.id);
     if (!rid) return interaction.reply({ content: "You don't have a linked account.", flags });
-    try {
-      await deleteLink(rid);
-    } catch (err) {
-      console.error('Failed to delete link:', err.message);
-      return interaction.reply({ content: 'Something went wrong unlinking. Try again in a moment.', flags });
-    }
     delete links[rid];
+    save();
     if (VERIFIED_ROLE_ID && interaction.inGuild()) {
       interaction.member.roles.remove(VERIFIED_ROLE_ID).catch(() => {});
     }
@@ -206,35 +144,13 @@ client.on('interactionCreate', async (interaction) => {
 
 client.once('ready', () => console.log(`Logged in as ${client.user.tag}`));
 
-/*
- * Send a notification to a linked Discord user.
- * - If channelId is given: post in that channel with an @mention (no DM).
- * - Otherwise: DM the user, falling back to FALLBACK_CHANNEL_ID if DMs are closed.
- * Returns 'dm' | 'channel' | null
- */
-async function notifyDiscordUser(discordId, { title, message, channelId }) {
+/* Send a notification to a linked Discord user. Returns 'dm' | 'channel' | null */
+async function notifyDiscordUser(discordId, { title, message }) {
   const embed = new EmbedBuilder()
     .setColor(0xe2231a)
     .setDescription(String(message).slice(0, 1000))
     .setTimestamp();
   if (title) embed.setTitle(String(title).slice(0, 200));
-
-  // Post in a specific channel instead of DMing
-  if (channelId) {
-    try {
-      const channel = await client.channels.fetch(channelId);
-      await channel.send({
-        content: `<@${discordId}>`,
-        embeds: [embed],
-        // Only ever ping the target user, never @everyone / roles
-        allowedMentions: { users: [discordId] },
-      });
-      return 'channel';
-    } catch (err) {
-      console.error('Channel send failed:', err.message);
-      return null;
-    }
-  }
 
   try {
     const user = await client.users.fetch(discordId);
@@ -248,6 +164,7 @@ async function notifyDiscordUser(discordId, { title, message, channelId }) {
         await channel.send({
           content: `<@${discordId}>`,
           embeds: [embed],
+          // Only ever ping the target user, never @everyone / roles
           allowedMentions: { users: [discordId] },
         });
         return 'channel';
@@ -293,15 +210,9 @@ app.post('/verify', auth, async (req, res) => {
     return res.status(409).json({ error: 'roblox_already_linked' });
   }
 
-  // Save to Firebase first so a player is never told "linked" when it wasn't saved
-  try {
-    await saveLink(userId, p.discordId);
-  } catch (err) {
-    console.error('Failed to save link:', err.message);
-    return res.status(500).json({ error: 'storage_failed' });
-  }
   pending.delete(code);
   links[userId] = p.discordId;
+  save();
 
   const name = (await robloxName(userId)) || `ID ${userId}`;
 
@@ -325,27 +236,82 @@ app.post('/verify', auth, async (req, res) => {
   res.json({ ok: true, robloxName: name });
 });
 
-/* Roblox game sends { userId, message, title?, channel? } to ping a player.
-   channel is a key from CHANNELS (e.g. "daycare"); omit it to DM the player. */
+/* Roblox game sends { userId, message, title? } to ping a player */
 app.post('/notify', auth, async (req, res) => {
   const userId = Number(req.body.userId);
-  const { message, title, channel } = req.body;
+  const { message, title } = req.body;
   if (!Number.isInteger(userId) || !message) {
     return res.status(400).json({ error: 'bad_request' });
-  }
-
-  let channelId;
-  if (channel) {
-    channelId = CHANNELS[channel];
-    if (!channelId) return res.status(400).json({ error: 'unknown_channel' });
   }
 
   const discordId = links[userId];
   if (!discordId) return res.status(404).json({ error: 'not_linked' });
 
-  const via = await notifyDiscordUser(discordId, { title, message, channelId });
+  const via = await notifyDiscordUser(discordId, { title, message });
   if (!via) return res.status(502).json({ error: 'could_not_deliver' });
   res.json({ ok: true, via });
+});
+
+/* Post a rich "showcase" embed to a named log channel (e.g. rare daycare eggs).
+   Channels come from env vars named CHANNEL_<NAME>, e.g. CHANNEL_DAYCARE=<channel id>.
+   Body: { channel, title, description?, color?, thumbnail?, fields?, userId?, robloxName? } */
+app.post('/showcase', auth, async (req, res) => {
+  const { channel, title, description, color, thumbnail, fields, userId, robloxName } = req.body || {};
+
+  if (typeof channel !== 'string' || !/^[a-z0-9_]{1,32}$/.test(channel)) {
+    return res.status(400).json({ error: 'bad_channel' });
+  }
+  const channelId = process.env[`CHANNEL_${channel.toUpperCase()}`];
+  if (!channelId) return res.status(404).json({ error: 'channel_not_configured' });
+  if (!title) return res.status(400).json({ error: 'bad_request' });
+
+  const embed = new EmbedBuilder().setTitle(String(title).slice(0, 256)).setTimestamp();
+  if (description) embed.setDescription(String(description).slice(0, 2000));
+
+  const c = Number(color);
+  if (Number.isInteger(c) && c >= 0 && c <= 0xffffff) embed.setColor(c);
+
+  if (typeof thumbnail === 'string') {
+    try {
+      if (new URL(thumbnail).protocol === 'https:') embed.setThumbnail(thumbnail);
+    } catch {
+      /* ignore bad URLs */
+    }
+  }
+
+  if (Array.isArray(fields)) {
+    const clean = fields
+      .filter((f) => f && f.name && f.value)
+      .slice(0, 10)
+      .map((f) => ({
+        name: String(f.name).slice(0, 256),
+        value: String(f.value).slice(0, 1000),
+        inline: Boolean(f.inline),
+      }));
+    if (clean.length) embed.addFields(clean);
+  }
+
+  if (robloxName) embed.setFooter({ text: `Roblox: ${String(robloxName).slice(0, 50)}` });
+
+  // Ping the player only if they linked their account. Never ping anyone else.
+  const discordId = Number.isInteger(Number(userId)) ? links[Number(userId)] : undefined;
+  const payload = { embeds: [embed] };
+  if (discordId) {
+    payload.content = `🎉 Congrats <@${discordId}>!`;
+    payload.allowedMentions = { users: [discordId] };
+  } else {
+    payload.allowedMentions = { parse: [] };
+  }
+
+  try {
+    const target = await client.channels.fetch(channelId);
+    if (!target || !target.isTextBased()) return res.status(500).json({ error: 'channel_not_text' });
+    await target.send(payload);
+    res.json({ ok: true, pinged: Boolean(discordId) });
+  } catch (err) {
+    console.error('Showcase failed:', err.message);
+    res.status(502).json({ error: 'could_not_deliver' });
+  }
 });
 
 /* Optional: check if a Roblox user is linked */
@@ -355,8 +321,11 @@ app.get('/linked/:userId', auth, (req, res) => {
 
 /* ------------------------------------------------------------------ */
 (async () => {
-  await initStorage(); // load saved links before accepting anything
-  await registerCommands();
+  try {
+    await registerCommands();
+  } catch (err) {
+    console.error('Could not register slash commands:', err.message);
+  }
   await client.login(DISCORD_TOKEN);
   app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
 })();
