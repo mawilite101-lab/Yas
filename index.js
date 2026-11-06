@@ -28,6 +28,15 @@ if (!DISCORD_TOKEN || !CLIENT_ID || !API_KEY) {
   process.exit(1);
 }
 
+/* Log unexpected errors instead of silently crashing the process
+   (a crash is what makes UptimeRobot see the bot as down). */
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+});
+
 /* ------------------------------------------------------------------ */
 /* Storage (simple JSON file: { robloxId: discordId })                 */
 /* ------------------------------------------------------------------ */
@@ -64,6 +73,8 @@ setInterval(() => {
 /* Discord bot                                                         */
 /* ------------------------------------------------------------------ */
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+client.on('error', (err) => console.error('Discord client error:', err.message));
 
 const commands = [
   new SlashCommandBuilder()
@@ -191,7 +202,12 @@ function auth(req, res, next) {
   next();
 }
 
-app.get('/health', (_req, res) => res.json({ ok: true }));
+/* Public health endpoints for UptimeRobot (no auth). Both / and /health work.
+   Reports 200 as long as the web server is up; "discord" shows bot status. */
+const health = (_req, res) =>
+  res.status(200).json({ ok: true, discord: client.isReady() ? 'connected' : 'connecting' });
+app.get('/', health);
+app.get('/health', health);
 
 /* Roblox game sends { userId, code } when a player types /link CODE */
 app.post('/verify', auth, async (req, res) => {
@@ -320,12 +336,20 @@ app.get('/linked/:userId', auth, (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
+/* Startup: web server FIRST so /health responds even if Discord fails */
+/* ------------------------------------------------------------------ */
 (async () => {
+  app.listen(PORT, '0.0.0.0', () => console.log(`API listening on port ${PORT}`));
+
   try {
     await registerCommands();
   } catch (err) {
     console.error('Could not register slash commands:', err.message);
   }
-  await client.login(DISCORD_TOKEN);
-  app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
+
+  try {
+    await client.login(DISCORD_TOKEN);
+  } catch (err) {
+    console.error('Discord login failed:', err.message);
+  }
 })();
