@@ -38,7 +38,9 @@ process.on('uncaughtException', (err) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* Storage (simple JSON file: { robloxId: discordId })                 */
+/* Storage (simple JSON files)                                         */
+/*   links.json:       { robloxId: discordId }                         */
+/*   wild-stats.json:  { robloxId: { total, shiny, gradient, ... } }   */
 /* ------------------------------------------------------------------ */
 const DATA_FILE = path.join(__dirname, 'links.json');
 let links = {};
@@ -48,6 +50,32 @@ try {
   links = {};
 }
 const save = () => fs.writeFileSync(DATA_FILE, JSON.stringify(links, null, 2));
+
+const STATS_FILE = path.join(__dirname, 'wild-stats.json');
+let stats = {};
+try {
+  stats = JSON.parse(fs.readFileSync(STATS_FILE, 'utf8'));
+} catch {
+  stats = {};
+}
+const saveStats = () => fs.writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2));
+
+const SIZE_LABELS = { tiny: 'Tiny', small: 'Small', big: 'Big', giant: 'Giant' };
+
+/* Always returns a fully-populated stats object for a Roblox user (fills in
+   any missing fields so older files keep working). */
+function getStats(robloxId) {
+  const s = (stats[robloxId] ||= {});
+  s.total ||= 0;
+  s.shiny ||= 0;
+  s.gradient ||= 0;
+  s.marks ||= 0;
+  s.sizes ||= {};
+  for (const k of Object.keys(SIZE_LABELS)) s.sizes[k] ||= 0;
+  return s;
+}
+
+const sizeTotal = (s) => Object.values(s.sizes).reduce((a, b) => a + b, 0);
 
 const robloxIdFor = (discordId) =>
   Object.keys(links).find((rid) => links[rid] === discordId);
@@ -86,6 +114,9 @@ const commands = [
   new SlashCommandBuilder()
     .setName('status')
     .setDescription('See which Roblox account you have linked'),
+  new SlashCommandBuilder()
+    .setName('finds')
+    .setDescription('See your wild shiny / gradient / mark / size finds'),
 ].map((c) => c.toJSON());
 
 async function registerCommands() {
@@ -151,24 +182,46 @@ client.on('interactionCreate', async (interaction) => {
     const name = (await robloxName(rid)) || 'Unknown';
     return interaction.reply({ content: `Linked to Roblox user **${name}** (ID \`${rid}\`).`, flags });
   }
+
+  if (interaction.commandName === 'finds') {
+    const rid = robloxIdFor(interaction.user.id);
+    if (!rid) return interaction.reply({ content: 'No Roblox account linked. Use `/link`.', flags });
+    const s = stats[rid] ? getStats(rid) : null;
+    if (!s || s.total === 0) {
+      return interaction.reply({ content: "No special wild finds tracked yet. Go get 'em! ✨", flags });
+    }
+    const embed = new EmbedBuilder()
+      .setTitle('Your wild finds')
+      .setColor(0xffd54f)
+      .addFields(
+        { name: '✨ Shiny', value: String(s.shiny), inline: true },
+        { name: '🌈 Gradiant', value: String(s.gradient), inline: true },
+        { name: '🏷️ Marked', value: String(s.marks), inline: true },
+        {
+          name: '📏 Sizes',
+          value: Object.entries(SIZE_LABELS)
+            .map(([k, label]) => `${label}: **${s.sizes[k]}**`)
+            .join('\n'),
+          inline: true,
+        },
+        { name: 'Total special finds', value: String(s.total), inline: true }
+      );
+    if (s.last) embed.setFooter({ text: `Latest: ${s.last}` });
+    return interaction.reply({ embeds: [embed], flags });
+  }
 });
 
 client.once('ready', () => console.log(`Logged in as ${client.user.tag}`));
 
-/* Send a notification to a linked Discord user. Returns 'dm' | 'channel' | null */
-async function notifyDiscordUser(discordId, { title, message }) {
-  const embed = new EmbedBuilder()
-    .setColor(0xe2231a)
-    .setDescription(String(message).slice(0, 1000))
-    .setTimestamp();
-  if (title) embed.setTitle(String(title).slice(0, 200));
-
+/* Deliver an embed to a linked Discord user. DM first; if their DMs are
+   closed, fall back to the fallback channel (pinging only them).
+   Returns 'dm' | 'channel' | null */
+async function deliverToUser(discordId, embed) {
   try {
     const user = await client.users.fetch(discordId);
     await user.send({ embeds: [embed] });
     return 'dm';
   } catch {
-    // DMs closed -> try the fallback channel
     if (FALLBACK_CHANNEL_ID) {
       try {
         const channel = await client.channels.fetch(FALLBACK_CHANNEL_ID);
@@ -185,6 +238,16 @@ async function notifyDiscordUser(discordId, { title, message }) {
     }
     return null;
   }
+}
+
+/* Send a notification to a linked Discord user. Returns 'dm' | 'channel' | null */
+function notifyDiscordUser(discordId, { title, message }) {
+  const embed = new EmbedBuilder()
+    .setColor(0xe2231a)
+    .setDescription(String(message).slice(0, 1000))
+    .setTimestamp();
+  if (title) embed.setTitle(String(title).slice(0, 200));
+  return deliverToUser(discordId, embed);
 }
 
 /* ------------------------------------------------------------------ */
@@ -252,6 +315,31 @@ app.post('/verify', auth, async (req, res) => {
   res.json({ ok: true, robloxName: name });
 });
 
+/* Roblox game sends { userId } to remove a link (DiscordBridge.Unlink) */
+app.post('/unlink', auth, async (req, res) => {
+  const userId = Number(req.body.userId);
+  if (!Number.isInteger(userId) || userId <= 0) {
+    return res.status(400).json({ error: 'bad_request' });
+  }
+  const discordId = links[userId];
+  if (!discordId) return res.status(404).json({ error: 'not_linked' });
+
+  delete links[userId];
+  save();
+
+  if (VERIFIED_ROLE_ID) {
+    for (const guild of client.guilds.cache.values()) {
+      try {
+        const member = await guild.members.fetch(discordId);
+        await member.roles.remove(VERIFIED_ROLE_ID);
+      } catch {
+        /* not in this guild or role missing */
+      }
+    }
+  }
+  res.json({ ok: true });
+});
+
 /* Roblox game sends { userId, message, title? } to ping a player */
 app.post('/notify', auth, async (req, res) => {
   const userId = Number(req.body.userId);
@@ -266,6 +354,131 @@ app.post('/notify', auth, async (req, res) => {
   const via = await notifyDiscordUser(discordId, { title, message });
   if (!via) return res.status(502).json({ error: 'could_not_deliver' });
   res.json({ ok: true, via });
+});
+
+/* Wild special-find tracker. Roblox sends this whenever a wild Pokémon spawns
+   as shiny / gradient / size variant / marked. The bot records it in
+   wild-stats.json and DMs the (linked) player a congratulations embed.
+
+   Body: {
+     userId, species, level?, shiny?, gradient?,
+     gradientColors?: ["#RRGGBB", ...],
+     size?: "tiny" | "small" | "big" | "giant", sizeScale?,
+     mark?: { name, title? },
+     sprite?, gamemode?, chain?, location?, robloxName?
+   } */
+app.post('/wild', auth, async (req, res) => {
+  const b = req.body || {};
+  const userId = Number(b.userId);
+  const species = String(b.species || '').slice(0, 60);
+  if (!Number.isInteger(userId) || userId <= 0 || !species) {
+    return res.status(400).json({ error: 'bad_request' });
+  }
+
+  const shiny = Boolean(b.shiny);
+  const gradient = Boolean(b.gradient);
+  const sizeKey = typeof b.size === 'string' ? b.size.toLowerCase() : null;
+  const sizeId = sizeKey && Object.hasOwn(SIZE_LABELS, sizeKey) ? sizeKey : null;
+  const mark =
+    b.mark && typeof b.mark === 'object' && b.mark.name
+      ? {
+          name: String(b.mark.name).slice(0, 60),
+          title: b.mark.title ? String(b.mark.title).slice(0, 60) : null,
+        }
+      : null;
+
+  if (!shiny && !gradient && !sizeId && !mark) {
+    return res.status(400).json({ error: 'not_special' });
+  }
+
+  const discordId = links[userId];
+  if (!discordId) return res.status(404).json({ error: 'not_linked' });
+
+  /* ---- track it ---- */
+  const s = getStats(userId);
+  s.total += 1;
+  if (shiny) s.shiny += 1;
+  if (gradient) s.gradient += 1;
+  if (mark) s.marks += 1;
+  if (sizeId) s.sizes[sizeId] += 1;
+
+  const tags = [];
+  if (shiny) tags.push('✨ Shiny');
+  if (gradient) tags.push('🌈 Gradiant');
+  if (sizeId) tags.push(`📏 ${SIZE_LABELS[sizeId]}`);
+  if (mark) tags.push(`🏷️ ${mark.name}`);
+
+  s.last = `${tags.join(' ')} ${species}`.slice(0, 100);
+  saveStats();
+
+  /* ---- build the congrats embed ---- */
+  const who = typeof b.robloxName === 'string' && b.robloxName ? ` ${b.robloxName.slice(0, 50)}` : '';
+  const combo = tags.length >= 2;
+  const lines = [
+    `Congratulations${who}! 🎉`,
+    `You just found a wild **${species}** that is ${tags.map((t) => `**${t.replace(/^\S+\s/, '')}**`).join(' + ')}!`,
+  ];
+  if (combo) lines.push('', 'That is an unreal combo — what a find! 🔥');
+
+  let color = 0xe2231a;
+  const firstGrad = Array.isArray(b.gradientColors) ? String(b.gradientColors[0] || '') : '';
+  if (gradient && /^#[0-9a-f]{6}$/i.test(firstGrad)) color = parseInt(firstGrad.slice(1), 16);
+  else if (shiny) color = 0xffd54f;
+  else if (sizeId) color = { tiny: 0x55c7ff, small: 0x9be7ff, big: 0xffb347, giant: 0xff5a36 }[sizeId];
+  else if (mark) color = 0xffd54f;
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🎉 Wild ${tags.join(' ')} ${species}!`.slice(0, 256))
+    .setColor(color)
+    .setDescription(lines.join('\n').slice(0, 2000))
+    .setTimestamp();
+
+  const fields = [];
+  if (b.level != null) fields.push({ name: 'Level', value: String(b.level).slice(0, 20), inline: true });
+  if (sizeId) {
+    const scale = b.sizeScale != null ? ` (x${String(b.sizeScale).slice(0, 10)})` : '';
+    fields.push({ name: 'Size', value: `${SIZE_LABELS[sizeId]}${scale}`, inline: true });
+  }
+  if (mark) {
+    fields.push({
+      name: 'Mark',
+      value: mark.title ? `${mark.name} — ${mark.title}` : mark.name,
+      inline: true,
+    });
+  }
+  if (gradient && Array.isArray(b.gradientColors)) {
+    const hexes = b.gradientColors
+      .map((c) => String(c))
+      .filter((c) => /^#[0-9a-f]{6}$/i.test(c))
+      .slice(0, 6);
+    if (hexes.length) {
+      fields.push({
+        name: 'Gradiant colors',
+        value: hexes.map((h) => `\`${h.toUpperCase()}\``).join(' → '),
+        inline: true,
+      });
+    }
+  }
+  if (b.gamemode) fields.push({ name: 'Gamemode', value: String(b.gamemode).slice(0, 30), inline: true });
+  if (b.chain != null) fields.push({ name: 'Capture chain', value: String(b.chain).slice(0, 10), inline: true });
+  if (b.location) fields.push({ name: 'Location', value: String(b.location).slice(0, 40), inline: true });
+  if (fields.length) embed.addFields(fields.slice(0, 10));
+
+  if (typeof b.sprite === 'string') {
+    try {
+      if (new URL(b.sprite).protocol === 'https:') embed.setThumbnail(b.sprite);
+    } catch {
+      /* ignore bad URLs */
+    }
+  }
+
+  embed.setFooter({
+    text: `Wild finds so far — ✨ ${s.shiny} · 🌈 ${s.gradient} · 🏷️ ${s.marks} · 📏 ${sizeTotal(s)}`,
+  });
+
+  const via = await deliverToUser(discordId, embed);
+  if (!via) return res.status(502).json({ error: 'could_not_deliver', tracked: true });
+  res.json({ ok: true, via, totals: { total: s.total, shiny: s.shiny, gradient: s.gradient, marks: s.marks } });
 });
 
 /* Post a rich "showcase" embed to a named log channel (e.g. rare daycare eggs).
